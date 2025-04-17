@@ -175,6 +175,11 @@ size_t MemTable::ApproximateMemoryUsage() {
 }
 
 bool MemTable::ShouldFlushNow() {
+  if (IsMarkedForFlush()) {
+    // TODO: dedicated flush reason when marked for flush
+    return true;
+  }
+
   // This is set if memtable_max_range_deletions is > 0,
   // and that many range deletions are done
   if (memtable_max_range_deletions_ > 0 &&
@@ -599,7 +604,7 @@ class MemTableIterator : public InternalIterator {
 InternalIterator* MemTable::NewIterator(
     const ReadOptions& read_options,
     UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping, Arena* arena,
-    const SliceTransform* prefix_extractor) {
+    const SliceTransform* prefix_extractor, bool /*for_flush*/) {
   assert(arena != nullptr);
   auto mem = arena->AllocateAligned(sizeof(MemTableIterator));
   return new (mem)
@@ -618,8 +623,8 @@ class TimestampStrippingIterator : public InternalIterator {
       const SliceTransform* cf_prefix_extractor, size_t ts_sz)
       : arena_mode_(arena != nullptr), kind_(kind), ts_sz_(ts_sz) {
     assert(ts_sz_ != 0);
-    void* mem = arena ? arena->AllocateAligned(sizeof(MemTableIterator)) :
-                      operator new(sizeof(MemTableIterator));
+    void* mem = arena ? arena->AllocateAligned(sizeof(MemTableIterator))
+                      : operator new(sizeof(MemTableIterator));
     iter_ = new (mem)
         MemTableIterator(kind, memtable, read_options, seqno_to_time_mapping,
                          arena, cf_prefix_extractor);
@@ -1251,47 +1256,16 @@ static bool SaveValue(void* arg, const char* entry) {
       case kTypeValue:
       case kTypeValuePreferredSeqno: {
         Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
-
         if (type == kTypeValuePreferredSeqno) {
           v = ParsePackedValueForValue(v);
         }
 
-        *(s->status) = Status::OK();
-
-        if (!s->do_merge) {
-          // Preserve the value with the goal of returning it as part of
-          // raw merge operands to the user
-          // TODO(yanqin) update MergeContext so that timestamps information
-          // can also be retained.
-
-          merge_context->PushOperand(
-              v, s->inplace_update_support == false /* operand_pinned */);
-        } else if (*(s->merge_in_progress)) {
-          assert(s->do_merge);
-
-          if (s->value || s->columns) {
-            // `op_failure_scope` (an output parameter) is not provided (set to
-            // nullptr) since a failure must be propagated regardless of its
-            // value.
-            *(s->status) = MergeHelper::TimedFullMerge(
-                merge_operator, s->key->user_key(),
-                MergeHelper::kPlainBaseValue, v, merge_context->GetOperands(),
-                s->logger, s->statistics, s->clock,
-                /* update_num_ops_stats */ true, /* op_failure_scope */ nullptr,
-                s->value, s->columns);
-          }
-        } else if (s->value) {
-          s->value->assign(v.data(), v.size());
-        } else if (s->columns) {
-          s->columns->SetPlainValue(v);
-        }
-
+        ReadOnlyMemTable::HandleTypeValue(
+            s->key->user_key(), v, s->inplace_update_support == false,
+            s->do_merge, *(s->merge_in_progress), merge_context,
+            s->merge_operator, s->clock, s->statistics, s->logger, s->status,
+            s->value, s->columns, s->is_blob_index);
         *(s->found_final_value) = true;
-
-        if (s->is_blob_index != nullptr) {
-          *(s->is_blob_index) = false;
-        }
-
         return false;
       }
       case kTypeWideColumnEntity: {
@@ -1348,70 +1322,21 @@ static bool SaveValue(void* arg, const char* entry) {
       case kTypeDeletionWithTimestamp:
       case kTypeSingleDeletion:
       case kTypeRangeDeletion: {
-        if (*(s->merge_in_progress)) {
-          if (s->value || s->columns) {
-            // `op_failure_scope` (an output parameter) is not provided (set to
-            // nullptr) since a failure must be propagated regardless of its
-            // value.
-            *(s->status) = MergeHelper::TimedFullMerge(
-                merge_operator, s->key->user_key(), MergeHelper::kNoBaseValue,
-                merge_context->GetOperands(), s->logger, s->statistics,
-                s->clock, /* update_num_ops_stats */ true,
-                /* op_failure_scope */ nullptr, s->value, s->columns);
-          } else {
-            // We have found a final value (a base deletion) and have newer
-            // merge operands that we do not intend to merge. Nothing remains
-            // to be done so assign status to OK.
-            *(s->status) = Status::OK();
-          }
-        } else {
-          *(s->status) = Status::NotFound();
-        }
+        ReadOnlyMemTable::HandleTypeDeletion(
+            s->key->user_key(), *(s->merge_in_progress), s->merge_context,
+            s->merge_operator, s->clock, s->statistics, s->logger, s->status,
+            s->value, s->columns);
         *(s->found_final_value) = true;
         return false;
       }
       case kTypeMerge: {
-        if (!merge_operator) {
-          *(s->status) = Status::InvalidArgument(
-              "merge_operator is not properly initialized.");
-          // Normally we continue the loop (return true) when we see a merge
-          // operand.  But in case of an error, we should stop the loop
-          // immediately and pretend we have found the value to stop further
-          // seek.  Otherwise, the later call will override this error status.
-          *(s->found_final_value) = true;
-          return false;
-        }
         Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
         *(s->merge_in_progress) = true;
-        merge_context->PushOperand(
-            v, s->inplace_update_support == false /* operand_pinned */);
-        PERF_COUNTER_ADD(internal_merge_point_lookup_count, 1);
-
-        if (s->do_merge && merge_operator->ShouldMerge(
-                               merge_context->GetOperandsDirectionBackward())) {
-          if (s->value || s->columns) {
-            // `op_failure_scope` (an output parameter) is not provided (set to
-            // nullptr) since a failure must be propagated regardless of its
-            // value.
-            *(s->status) = MergeHelper::TimedFullMerge(
-                merge_operator, s->key->user_key(), MergeHelper::kNoBaseValue,
-                merge_context->GetOperands(), s->logger, s->statistics,
-                s->clock, /* update_num_ops_stats */ true,
-                /* op_failure_scope */ nullptr, s->value, s->columns);
-          }
-
-          *(s->found_final_value) = true;
-          return false;
-        }
-        if (merge_context->get_merge_operands_options != nullptr &&
-            merge_context->get_merge_operands_options->continue_cb != nullptr &&
-            !merge_context->get_merge_operands_options->continue_cb(v)) {
-          // We were told not to continue.
-          *(s->found_final_value) = true;
-          return false;
-        }
-
-        return true;
+        *(s->found_final_value) = ReadOnlyMemTable::HandleTypeMerge(
+            s->key->user_key(), v, s->inplace_update_support == false,
+            s->do_merge, merge_context, s->merge_operator, s->clock,
+            s->statistics, s->logger, s->status, s->value, s->columns);
+        return !*(s->found_final_value);
       }
       default: {
         std::string msg("Corrupted value not expected.");

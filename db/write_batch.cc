@@ -815,6 +815,12 @@ WriteBatchInternal::GetColumnFamilyIdAndTimestampSize(
         s = Status::InvalidArgument("Default cf timestamp size mismatch");
       }
     }
+    auto* cfd =
+        static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+    if (cfd && cfd->ioptions().disallow_memtable_writes) {
+      s = Status::InvalidArgument(
+          "This column family has disallow_memtable_writes=true");
+    }
   } else if (b->default_cf_ts_sz_ > 0) {
     ts_sz = b->default_cf_ts_sz_;
   }
@@ -835,6 +841,12 @@ Status CheckColumnFamilyTimestampSize(ColumnFamilyHandle* column_family,
   }
   if (cf_ts_sz != ts.size()) {
     return Status::InvalidArgument("timestamp size mismatch");
+  }
+  auto* cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+  if (cfd && cfd->ioptions().disallow_memtable_writes) {
+    return Status::InvalidArgument(
+        "This column family has disallow_memtable_writes=true");
   }
   return Status::OK();
 }
@@ -1160,6 +1172,34 @@ Status WriteBatchInternal::InsertNoop(WriteBatch* b) {
   return Status::OK();
 }
 
+ValueType WriteBatchInternal::GetBeginPrepareType(bool write_after_commit,
+                                                  bool unprepared_batch) {
+  return write_after_commit
+             ? kTypeBeginPrepareXID
+             : (unprepared_batch ? kTypeBeginUnprepareXID
+                                 : kTypeBeginPersistedPrepareXID);
+}
+
+Status WriteBatchInternal::InsertBeginPrepare(WriteBatch* b,
+                                              bool write_after_commit,
+                                              bool unprepared_batch) {
+  b->rep_.push_back(static_cast<char>(
+      GetBeginPrepareType(write_after_commit, unprepared_batch)));
+  b->content_flags_.store(b->content_flags_.load(std::memory_order_relaxed) |
+                              ContentFlags::HAS_BEGIN_PREPARE,
+                          std::memory_order_relaxed);
+  return Status::OK();
+}
+
+Status WriteBatchInternal::InsertEndPrepare(WriteBatch* b, const Slice& xid) {
+  b->rep_.push_back(static_cast<char>(kTypeEndPrepareXID));
+  PutLengthPrefixedSlice(&b->rep_, xid);
+  b->content_flags_.store(b->content_flags_.load(std::memory_order_relaxed) |
+                              ContentFlags::HAS_END_PREPARE,
+                          std::memory_order_relaxed);
+  return Status::OK();
+}
+
 Status WriteBatchInternal::MarkEndPrepare(WriteBatch* b, const Slice& xid,
                                           bool write_after_commit,
                                           bool unprepared_batch) {
@@ -1175,13 +1215,8 @@ Status WriteBatchInternal::MarkEndPrepare(WriteBatch* b, const Slice& xid,
 
   // rewrite noop as begin marker
   b->rep_[12] = static_cast<char>(
-      write_after_commit ? kTypeBeginPrepareXID
-                         : (unprepared_batch ? kTypeBeginUnprepareXID
-                                             : kTypeBeginPersistedPrepareXID));
-  b->rep_.push_back(static_cast<char>(kTypeEndPrepareXID));
-  PutLengthPrefixedSlice(&b->rep_, xid);
+      GetBeginPrepareType(write_after_commit, unprepared_batch));
   b->content_flags_.store(b->content_flags_.load(std::memory_order_relaxed) |
-                              ContentFlags::HAS_END_PREPARE |
                               ContentFlags::HAS_BEGIN_PREPARE,
                           std::memory_order_relaxed);
   if (unprepared_batch) {
@@ -1189,7 +1224,7 @@ Status WriteBatchInternal::MarkEndPrepare(WriteBatch* b, const Slice& xid,
                                 ContentFlags::HAS_BEGIN_UNPREPARE,
                             std::memory_order_relaxed);
   }
-  return Status::OK();
+  return WriteBatchInternal::InsertEndPrepare(b, xid);
 }
 
 Status WriteBatchInternal::MarkCommit(WriteBatch* b, const Slice& xid) {
@@ -2162,6 +2197,13 @@ class MemTableInserter : public WriteBatch::Handler {
       }
       return false;
     }
+    auto* current = cf_mems_->current();
+    if (current && current->ioptions().disallow_memtable_writes) {
+      *s = Status::InvalidArgument(
+          "This column family has disallow_memtable_writes=true");
+      return false;
+    }
+
     if (recovering_log_number_ != 0 &&
         recovering_log_number_ < cf_mems_->GetLogNumber()) {
       // This is true only in recovery environment (recovering_log_number_ is
@@ -2905,10 +2947,9 @@ class MemTableInserter : public WriteBatch::Handler {
       auto* cfd = cf_mems_->current();
 
       assert(cfd);
-      assert(cfd->ioptions());
 
       const size_t size_to_maintain = static_cast<size_t>(
-          cfd->ioptions()->max_write_buffer_size_to_maintain);
+          cfd->ioptions().max_write_buffer_size_to_maintain);
 
       if (size_to_maintain > 0) {
         MemTableList* const imm = cfd->imm();

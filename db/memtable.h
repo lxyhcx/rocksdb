@@ -18,6 +18,7 @@
 
 #include "db/dbformat.h"
 #include "db/kv_checksum.h"
+#include "db/merge_helper.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/read_callback.h"
 #include "db/seqno_to_time_mapping.h"
@@ -29,6 +30,7 @@
 #include "rocksdb/db.h"
 #include "rocksdb/memtablerep.h"
 #include "table/multiget_context.h"
+#include "util/atomic.h"
 #include "util/cast_util.h"
 #include "util/dynamic_bloom.h"
 #include "util/hash.h"
@@ -152,7 +154,7 @@ class ReadOnlyMemTable {
   virtual InternalIterator* NewIterator(
       const ReadOptions& read_options,
       UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping, Arena* arena,
-      const SliceTransform* prefix_extractor) = 0;
+      const SliceTransform* prefix_extractor, bool for_flush) = 0;
 
   // Returns an iterator that wraps a MemTableIterator and logically strips the
   // user-defined timestamp of each key. This API is only used by flush when
@@ -185,10 +187,13 @@ class ReadOnlyMemTable {
                                               SequenceNumber read_seq,
                                               size_t ts_sz) = 0;
 
-  // Used to Get value associated with key or Get Merge Operands associated
-  // with key.
-  // Keys are considered if they are no larger than the parameter `key` in
+  // Used to get value associated with `key`, or Merge operands associated
+  // with key, or get the latest sequence number of `key` (e.g. transaction
+  // conflict checking).
+  //
+  // Keys are considered if they are no smaller than the parameter `key` in
   // the order defined by comparator and share the save user key with `key`.
+  //
   // If do_merge = true the default behavior which is Get value for key is
   // executed. Expected behavior is described right below.
   // If memtable contains a value for key, store it in *value and return true.
@@ -206,6 +211,7 @@ class ReadOnlyMemTable {
   // returned).  Otherwise, *seq will be set to kMaxSequenceNumber.
   // On success, *s may be set to OK, NotFound, or MergeInProgress.  Any other
   // status returned indicates a corruption or other unexpected error.
+  //
   // If do_merge = false then any Merge Operands encountered for key are simply
   // stored in merge_context.operands_list and never actually merged to get a
   // final value. The raw Merge Operands are eventually returned to the user.
@@ -214,6 +220,9 @@ class ReadOnlyMemTable {
   // @param column If not null and memtable contains a value/WideColumn for key,
   // `column` will be set to the result value/WideColumn.
   // Note: only one of `value` and `column` can be non-nullptr.
+  // To only query for key existence or the latest sequence number of a key,
+  // `value` and `column` can be both nullptr. In this case, returned status can
+  // be OK, NotFound or MergeInProgress if a key is found.
   // @param immutable_memtable Whether this memtable is immutable. Used
   // internally by NewRangeTombstoneIterator(). See comment above
   // NewRangeTombstoneIterator() for more detail.
@@ -265,6 +274,11 @@ class ReadOnlyMemTable {
   // REQUIRES: external synchronization to prevent simultaneous
   // operations on the same MemTable (unless this Memtable is immutable).
   virtual SequenceNumber GetFirstSequenceNumber() = 0;
+
+  // Returns if there is no entry inserted to the mem table.
+  // REQUIRES: external synchronization to prevent simultaneous
+  // operations on the same MemTable (unless this Memtable is immutable).
+  virtual bool IsEmpty() const = 0;
 
   // Returns the sequence number that is guaranteed to be smaller than or equal
   // to the sequence number of any key that could be inserted into this
@@ -341,13 +355,13 @@ class ReadOnlyMemTable {
   // be flushed to storage
   // REQUIRES: external synchronization to prevent simultaneous
   // operations on the same MemTable.
-  uint64_t GetNextLogNumber() const { return mem_next_logfile_number_; }
+  uint64_t GetNextLogNumber() const { return mem_next_walfile_number_; }
 
   // Sets the next active logfile number when this memtable is about to
   // be flushed to storage
   // REQUIRES: external synchronization to prevent simultaneous
   // operations on the same MemTable.
-  void SetNextLogNumber(uint64_t num) { mem_next_logfile_number_ = num; }
+  void SetNextLogNumber(uint64_t num) { mem_next_walfile_number_ = num; }
 
   // REQUIRES: db_mutex held.
   void SetID(uint64_t id) { id_ = id; }
@@ -366,11 +380,126 @@ class ReadOnlyMemTable {
 
   void SetFlushJobInfo(std::unique_ptr<FlushJobInfo>&& info) {
     flush_job_info_ = std::move(info);
-  };
+  }
 
   std::unique_ptr<FlushJobInfo> ReleaseFlushJobInfo() {
     return std::move(flush_job_info_);
   }
+
+  static void HandleTypeValue(
+      const Slice& lookup_user_key, const Slice& value, bool value_pinned,
+      bool do_merge, bool merge_in_progress, MergeContext* merge_context,
+      const MergeOperator* merge_operator, SystemClock* clock,
+      Statistics* statistics, Logger* info_log, Status* s,
+      std::string* out_value, PinnableWideColumns* out_columns,
+      bool* is_blob_index) {
+    *s = Status::OK();
+
+    if (!do_merge) {
+      // Preserve the value with the goal of returning it as part of
+      // raw merge operands to the user
+      // TODO(yanqin) update MergeContext so that timestamps information
+      // can also be retained.
+      merge_context->PushOperand(value, value_pinned);
+    } else if (merge_in_progress) {
+      // `op_failure_scope` (an output parameter) is not provided (set to
+      // nullptr) since a failure must be propagated regardless of its
+      // value.
+      if (out_value || out_columns) {
+        *s = MergeHelper::TimedFullMerge(
+            merge_operator, lookup_user_key, MergeHelper::kPlainBaseValue,
+            value, merge_context->GetOperands(), info_log, statistics, clock,
+            /* update_num_ops_stats */ true,
+            /* op_failure_scope */ nullptr, out_value, out_columns);
+      }
+    } else if (out_value) {
+      out_value->assign(value.data(), value.size());
+    } else if (out_columns) {
+      out_columns->SetPlainValue(value);
+    }
+
+    if (is_blob_index) {
+      *is_blob_index = false;
+    }
+  }
+
+  static void HandleTypeDeletion(
+      const Slice& lookup_user_key, bool merge_in_progress,
+      MergeContext* merge_context, const MergeOperator* merge_operator,
+      SystemClock* clock, Statistics* statistics, Logger* logger, Status* s,
+      std::string* out_value, PinnableWideColumns* out_columns) {
+    if (merge_in_progress) {
+      if (out_value || out_columns) {
+        // `op_failure_scope` (an output parameter) is not provided (set to
+        // nullptr) since a failure must be propagated regardless of its
+        // value.
+        *s = MergeHelper::TimedFullMerge(
+            merge_operator, lookup_user_key, MergeHelper::kNoBaseValue,
+            merge_context->GetOperands(), logger, statistics, clock,
+            /* update_num_ops_stats */ true,
+            /* op_failure_scope */ nullptr, out_value, out_columns);
+      } else {
+        // We have found a final value (a base deletion) and have newer
+        // merge operands that we do not intend to merge. Nothing remains
+        // to be done so assign status to OK.
+        *s = Status::OK();
+      }
+    } else {
+      *s = Status::NotFound();
+    }
+  }
+
+  // Returns if a final value is found.
+  static bool HandleTypeMerge(const Slice& lookup_user_key, const Slice& value,
+                              bool value_pinned, bool do_merge,
+                              MergeContext* merge_context,
+                              const MergeOperator* merge_operator,
+                              SystemClock* clock, Statistics* statistics,
+                              Logger* logger, Status* s, std::string* out_value,
+                              PinnableWideColumns* out_columns) {
+    if (!merge_operator) {
+      *s = Status::InvalidArgument(
+          "merge_operator is not properly initialized.");
+      // Normally we continue the loop (return true) when we see a merge
+      // operand.  But in case of an error, we should stop the loop
+      // immediately and pretend we have found the value to stop further
+      // seek.  Otherwise, the later call will override this error status.
+      return true;
+    }
+    merge_context->PushOperand(value, value_pinned /* operand_pinned */);
+    PERF_COUNTER_ADD(internal_merge_point_lookup_count, 1);
+
+    if (do_merge && merge_operator->ShouldMerge(
+                        merge_context->GetOperandsDirectionBackward())) {
+      if (out_value || out_columns) {
+        // `op_failure_scope` (an output parameter) is not provided (set to
+        // nullptr) since a failure must be propagated regardless of its
+        // value.
+        *s = MergeHelper::TimedFullMerge(
+            merge_operator, lookup_user_key, MergeHelper::kNoBaseValue,
+            merge_context->GetOperands(), logger, statistics, clock,
+            /* update_num_ops_stats */ true,
+            /* op_failure_scope */ nullptr, out_value, out_columns);
+      }
+      return true;
+    }
+    if (merge_context->get_merge_operands_options != nullptr &&
+        merge_context->get_merge_operands_options->continue_cb != nullptr &&
+        !merge_context->get_merge_operands_options->continue_cb(value)) {
+      // We were told not to continue. `status` may be MergeInProress(),
+      // overwrite to signal the end of successful get. This status
+      // will be checked at the end of GetImpl().
+      *s = Status::OK();
+      return true;
+    }
+
+    // no final value found yet
+    return false;
+  }
+
+  void MarkForFlush() { marked_for_flush_.StoreRelaxed(true); }
+
+  bool IsMarkedForFlush() const { return marked_for_flush_.LoadRelaxed(); }
 
  protected:
   friend class MemTableList;
@@ -387,7 +516,7 @@ class ReadOnlyMemTable {
   VersionEdit edit_;
 
   // The log files earlier than this number can be deleted.
-  uint64_t mem_next_logfile_number_{0};
+  uint64_t mem_next_walfile_number_{0};
 
   // Memtable id to track flush.
   uint64_t id_ = 0;
@@ -400,6 +529,8 @@ class ReadOnlyMemTable {
 
   // Flush job info of the current memtable.
   std::unique_ptr<FlushJobInfo> flush_job_info_;
+
+  RelaxedAtomic<bool> marked_for_flush_{false};
 };
 
 class MemTable final : public ReadOnlyMemTable {
@@ -471,7 +602,7 @@ class MemTable final : public ReadOnlyMemTable {
   InternalIterator* NewIterator(
       const ReadOptions& read_options,
       UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping, Arena* arena,
-      const SliceTransform* prefix_extractor) override;
+      const SliceTransform* prefix_extractor, bool for_flush) override;
 
   InternalIterator* NewTimestampStrippingIterator(
       const ReadOptions& read_options,
@@ -603,10 +734,7 @@ class MemTable final : public ReadOnlyMemTable {
     }
   }
 
-  // Returns if there is no entry inserted to the mem table.
-  // REQUIRES: external synchronization to prevent simultaneous
-  // operations on the same MemTable (unless this Memtable is immutable).
-  bool IsEmpty() const { return first_seqno_ == 0; }
+  bool IsEmpty() const override { return first_seqno_ == 0; }
 
   SequenceNumber GetFirstSequenceNumber() override {
     return first_seqno_.load(std::memory_order_relaxed);

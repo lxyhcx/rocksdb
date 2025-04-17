@@ -40,8 +40,6 @@ struct ImmutableCFOptions {
 
   int min_write_buffer_number_to_merge;
 
-  int max_write_buffer_number_to_maintain;
-
   int64_t max_write_buffer_size_to_maintain;
 
   bool inplace_update_support;
@@ -67,6 +65,8 @@ struct ImmutableCFOptions {
   bool optimize_filters_for_hits;
 
   bool force_consistency_checks;
+
+  bool disallow_memtable_writes;
 
   Temperature default_temperature;
 
@@ -173,7 +173,8 @@ struct MutableCFOptions {
         memtable_max_range_deletions(options.memtable_max_range_deletions),
         bottommost_file_compaction_delay(
             options.bottommost_file_compaction_delay),
-        uncache_aggressiveness(options.uncache_aggressiveness) {
+        uncache_aggressiveness(options.uncache_aggressiveness),
+        memtable_op_scan_flush_trigger(options.memtable_op_scan_flush_trigger) {
     RefreshDerivedOptions(options.num_levels, options.compaction_style);
   }
 
@@ -228,7 +229,8 @@ struct MutableCFOptions {
         sample_for_compression(0),
         memtable_max_range_deletions(0),
         bottommost_file_compaction_delay(0),
-        uncache_aggressiveness(0) {}
+        uncache_aggressiveness(0),
+        memtable_op_scan_flush_trigger(0) {}
 
   explicit MutableCFOptions(const Options& options);
 
@@ -248,6 +250,10 @@ struct MutableCFOptions {
   }
 
   void Dump(Logger* log) const;
+
+#if __cplusplus >= 202002L
+  bool operator==(const MutableCFOptions& rhs) const = default;
+#endif
 
   // Memtable related options
   size_t write_buffer_size;
@@ -332,6 +338,7 @@ struct MutableCFOptions {
   uint32_t memtable_max_range_deletions;
   uint32_t bottommost_file_compaction_delay;
   uint32_t uncache_aggressiveness;
+  uint32_t memtable_op_scan_flush_trigger;
 
   // Derived options
   // Per-level target file size.
@@ -341,9 +348,10 @@ struct MutableCFOptions {
 uint64_t MultiplyCheckOverflow(uint64_t op1, double op2);
 
 // Get the max file size in a given level.
-uint64_t MaxFileSizeForLevel(const MutableCFOptions& cf_options,
-    int level, CompactionStyle compaction_style, int base_level = 1,
-    bool level_compaction_dynamic_level_bytes = false);
+uint64_t MaxFileSizeForLevel(const MutableCFOptions& cf_options, int level,
+                             CompactionStyle compaction_style,
+                             int base_level = 1,
+                             bool level_compaction_dynamic_level_bytes = false);
 
 // Get the max size of an L0 file for which we will pin its meta-blocks when
 // `pin_l0_filter_and_index_blocks_in_cache` is set.
@@ -360,6 +368,7 @@ Status GetMutableOptionsFromStrings(
 
 #ifndef NDEBUG
 std::vector<std::string> TEST_GetImmutableInMutableCFOptions();
+extern bool TEST_allowSetOptionsImmutableInMutable;
 #endif
 
 }  // namespace ROCKSDB_NAMESPACE
